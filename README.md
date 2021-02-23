@@ -50,7 +50,7 @@ You can define a service stub with the macro:
 provided that your service was defined in a protobuf and you have
 imported it.
 
-The `wrap-stup` macro automatically generates the wrappers for the
+The `wrap-stub` macro automatically generates the wrappers for the
 methods, that you have defined in your service.
 
 
