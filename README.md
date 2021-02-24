@@ -41,6 +41,51 @@ The opposite can be done with:
 No need to define a function for that.
 
 
+### Server
+
+The call
+
+```clojure
+(start-server port services)
+```
+
+starts a GRPC server on `port` exposing a list of services.
+
+The services you need to pass to this function can be defined with the
+macro:
+
+```clojure
+(def-service name method ...)
+```
+
+The syntax is similar to `reify`.  The methods defined with this macro
+should match those declared in the protobuf file.  Each method should
+accept the argument(s) specified in the protobuf file and return a
+sequence of maps.  Both are automatically converted to/from protobuf
+POJOs for you.
+
+Example:
+
+```clojure
+;; Greeter is a service with two methods: sayHello() and sayGoodbye()
+(def-service Greeter
+  (say-hello [request]
+    (println "Hi" (:who request)))
+  (say-goodbye [request]
+    (println "Goodbye" (:who request))))
+```
+
+will define a function `make-greeter-service` that you can call
+without arguments to create an instance of the Greeter service (from
+your protobuf definition).
+
+Then you can do:
+
+```clojure
+(start-server 1337 [(make-greeter-service)])
+```
+
+
 ### Client
 
 You can define a service stub with the macro:
@@ -68,41 +113,9 @@ A complete example with `with-stub`:
 (def connect-to-my-greeter (def-blocking-stub-maker Greeter))
 
 (with-stub [s (connect-to-my-greeter "localhost" 1337)]
-  (greeter-say-hello s "Alice")
-  (greeter-say-goodbye s "Bob"))
+  (greeter-say-hello s {:who "Alice"})
+  (greeter-say-goodbye s {:who "Bob"}))
 ```
-
-Somewhere else, someone else, may have noticed:
-
-```
-Hi Alice!
-Goodbye Bob.
-```
-
-appearing on his teletype.
-
-
-### Server
-
-The call
-
-```clojure
-(start-server port services)
-```
-
-starts a GRPC server on `port` exposing a list of services.  The
-services you need to pass to this function can be defined with the
-macro:
-
-```clojure
-(def-service name method ...)
-```
-
-The methods defined with this macro should match those declared in the
-protobuf file.  Each method should accept the argument(s) specified in
-the protobuf file and return a sequence of maps.  Those are
-automatically converted to protobuf POJOs for you.
-
 
 
 ## License
