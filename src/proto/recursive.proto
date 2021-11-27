@@ -1,0 +1,30 @@
+syntax = "proto3";
+
+option java_package = "protobluff.test";
+
+package recursive;
+
+message A {
+  A a = 1;
+}
+
+message B1 {
+  B2 b2 = 1;
+}
+
+message B2 {
+  B1 b1 = 1;
+}
+
+message C1 {
+  C2 c2 = 1;
+}
+
+message C2 {
+  C3 c3 = 1;
+}
+
+message C3 {
+  C1 c1 = 1;
+}
+
