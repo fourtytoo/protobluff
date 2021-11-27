@@ -2,10 +2,19 @@
   (:require [camel-snake-kebab.core :as csk]
             [clojure.string :as s])
   (:import [java.lang.reflect Modifier]
-           [io.grpc ServerBuilder ManagedChannelBuilder]
-           [java.util.concurrent TimeUnit]))
+           [io.grpc CallCredentials Context Contexts ManagedChannelBuilder
+            Metadata Metadata$Key
+            ServerBuilder ServerCall$Listener ServerInterceptor
+            Status]
+           [java.util.concurrent TimeUnit]
+           [com.google.protobuf.util JsonFormat]))
 
 
+(def kck
+  #(csk/->kebab-case-keyword % :separator \_))
+
+(def kcs
+  #(csk/->kebab-case-symbol % :separator \_))
 
 (defn class-methods [class]
   (.getMethods class))
@@ -26,15 +35,25 @@
 (defn invoke-static-method [class method & args]
   (clojure.lang.Reflector/invokeStaticMethod class method (into-array Object args)))
 
+(defn int->enum [enum-type x]
+  (invoke-static-method enum-type "forNumber" x))
+
 (defn enum->map [klass]
   (->> (invoke-static-method klass "values")
        seq
-       (map (juxt #(csk/->kebab-case-keyword (.name %))
+       (map (juxt #(kck (.name %))
                   identity))
        (into {})))
 
 (defn enum-keywords [klass]
   (keys (enum->map klass)))
+
+(defn wrap-static-method [class method-name args]
+  (let [method (.getMethod class method-name (into-array Class args))]
+    (fn [& args]
+      (.invoke method nil (to-array args)))))
+
+(def byte-array-class (class (byte-array [])))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
@@ -62,42 +81,52 @@
                  (zero? (.getParameterCount method))))
        first))
 
+(defn method-type [builder]
+  (.getReturnType builder))
+
 (defn make-converter-to-protobuf
   "Make a function that accepts a Clojure type (usually a map) and
   convert it to a PROTOBUF POJO of type `val-type`.  Return a function."
-  [val-type]
-  (let [new-builder (new-builder-method val-type)]
-    (cond new-builder
-          (let [setters (builder-setters (.getReturnType new-builder))]
-            (fn [v]
-              (let [b1 (.invoke new-builder val-type nil #_(into-array Object []))]
-                (try (-> (if (and *ignore-nils*
-                                  (nil? v))
-                           ;; avoid null pointer exceptions
-                           b1
-                           (do
-                             (doseq [[k v] v]
-                               (if-let [setter (get setters k)]
-                                 (setter b1 v)
-                                 (throw (ex-info "unknown member in class" {:key k :value v :type val-type}))))
-                             b1))
-                         .build)
-                     (catch Exception e
-                       (throw (ex-info "in to-protobuf" {:builder b1 :type val-type :value v} e)))))))
+  ([val-type]
+   (make-converter-to-protobuf val-type {}))
+  ([val-type visited-types]
+   (let [new-builder (new-builder-method val-type)]
+     (cond new-builder
+           (if-let [f (get visited-types val-type)]
+             (fn [v]
+               (@f v))
+             (let [converter-place (volatile! nil)
+                   setters (builder-setters (method-type new-builder) (assoc visited-types val-type converter-place))
+                   converter (fn [v]
+                               (let [b1 (.invoke new-builder val-type nil)]
+                                 (try (-> (if (and *ignore-nils*
+                                                   (nil? v))
+                                            ;; avoid null pointer exceptions
+                                            b1
+                                            (do
+                                              (doseq [[k v] v]
+                                                (if-let [setter (get setters k)]
+                                                  (setter b1 v)
+                                                  (throw (ex-info "unknown member in class" {:key k :value v :type val-type :available-setters setters}))))
+                                              b1))
+                                          .build)
+                                      (catch Exception e
+                                        (throw (ex-info "in to-protobuf" {:builder b1 :type val-type :value v} e))))))]
+               (vreset! converter-place converter)))
 
-          (class-is-enum? val-type)
-          (fn [v]
-            (if (number? v)
-              (invoke-static-method val-type "forNumber" v)
-              (keyword->enum val-type v)))
+           (class-is-enum? val-type)
+           (fn [v]
+             (if (number? v)
+               (int->enum val-type v)
+               (keyword->enum val-type v)))
 
-          (= String val-type)
-          str
+           (= String val-type)
+           str
 
-          (= Integer/TYPE val-type)
-          int
+           (= Integer/TYPE val-type)
+           int
 
-          :else identity)))
+           :else identity))))
 
 (defn- builder-type? [type]
   (-> (.getSimpleName type)
@@ -125,15 +154,15 @@
               (not (builder-type? (first pars)))))))
 
 (defn- method->key [method]
-  (csk/->kebab-case-keyword (subs (.getName method) 3)))
+  (kck (subs (.getName method) 3)))
 
-(defn builder-setters [builder-class]
+(defn builder-setters [builder-class visited-types]
   (->> (class-methods builder-class)
        (map (fn [method]
               (cond (setter-method? method)
                     (let [method-key (method->key method)
                           val-type (first (.getParameterTypes method))
-                          to-protobuf (make-converter-to-protobuf val-type)]
+                          to-protobuf (make-converter-to-protobuf val-type visited-types)]
                       [method-key
                        (fn [builder v]
                          (let [value (to-protobuf v)]
@@ -147,7 +176,7 @@
                     (adder-method? method)
                     (let [method-key (method->key method)
                           val-type (first (.getParameterTypes method))
-                          to-protobuf (make-converter-to-protobuf val-type)]
+                          to-protobuf (make-converter-to-protobuf val-type visited-types)]
                       [method-key
                        (fn [builder v]
                          (->> (map (fn [e]
@@ -166,8 +195,8 @@
                     (putter-method? method)
                     (let [method-key (method->key method)
                           [key-type value-type] (map #(.getType %) (.getAnnotatedParameterTypes method))
-                          key-to-protobuf (make-converter-to-protobuf key-type)
-                          value-to-protobuf (make-converter-to-protobuf value-type)]
+                          key-to-protobuf (make-converter-to-protobuf key-type visited-types)
+                          value-to-protobuf (make-converter-to-protobuf value-type visited-types)]
                       [method-key
                        (fn [builder v]
                          (->> (map (fn [[k v]]
@@ -229,13 +258,13 @@
 
 (defmethod from-protobuf com.google.protobuf.Descriptors$EnumValueDescriptor
   [response]
-  (csk/->kebab-case-keyword (.getName response)))
+  (kck (.getName response)))
 
 (defmethod from-protobuf com.google.protobuf.MessageOrBuilder
   [response]
   (->> (.getAllFields response)
        (map (fn [[field value]]
-              [(csk/->kebab-case-keyword (.getName field))
+              [(kck (.getName field))
                (from-protobuf value)]))
        (into {})))
 
@@ -287,30 +316,79 @@
                        "BlockingStub")]
     (Class/forName stub-name)))
 
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defn make-metadata-key [key-name & [marshaller]]
+  (Metadata$Key/of (name key-name) (or marshaller Metadata/ASCII_STRING_MARSHALLER)))
+
+(def ^:private authentication-metadata-key
+  (make-metadata-key :authentication))
+
+(defn as-metadata-key [k]
+  (if (instance? Metadata$Key k)
+    k
+    (make-metadata-key k)))
+
+(defn simple-call-credentials
+  "Instantiate a `CallCredential` object.  The object's
+  `applyRequestMetadata` method will call `f` every time it needs to
+  generate an authentication token.  The function `f` is called
+  without arguments and should return a string. The `k` argument
+  should be a metadata key to be used to pass the authentication
+  token; it is either a Clojure keyword or a `Metadata$Key` instance."
+  [k f]
+  (let [k (as-metadata-key k)]
+    (proxy [CallCredentials] []
+      (applyRequestMetadata [req-info executor metadata-applier]
+        (.execute executor (fn []
+                             (try
+                               (.apply metadata-applier
+                                       (doto (Metadata.)
+                                         (.put k (f))))
+                               (catch Exception e
+                                 (.fail metadata-applier
+                                        (.withCause (Status/UNAUTHENTICATED) e)))))))
+      (thisUsesUnstableApi []
+        'yes-we-know))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defn- stub-method-definition [service method arg-types]
+  (let [args (repeatedly (count arg-types) #(gensym "arg"))
+        converters (repeatedly (count arg-types) #(gensym "to-protobuf"))
+        stub (gensym "stub")
+        cc (gensym "call-credentials")]
+    `(let ~(vec (mapcat (fn [cv type]
+                          `(~cv (make-converter-to-protobuf ~type)))
+                        converters arg-types))
+       (defn ~(kcs (str service "-" method))
+         ~(vec (cons stub
+                     (concat args
+                             `(& {~cc :call-credentials}))))
+         (from-protobuf
+          (-> (if ~cc
+                (.withCallCredentials ~stub ~cc)
+                ~stub)
+              (. ~(symbol method)
+                 ~@(map (fn [cv arg]
+                          `(~cv ~arg))
+                        converters args))))))))
+
 (defmacro wrap-stub
   "Expose the interface to a GRPC service stub with the automatic
   definition of the corresponding wrapper functions.  If, for
   instance, the service `Greeter` defines the methods `sayHello` and
   `sayGoodbye`, the functions `greeter-say-hello` and
-  `greeter-say-goodbye` will be automatically defined for you."
+  `greeter-say-goodbye` will be automatically defined for you.  The
+  key argument :call-credentials should be a function returning an
+  authentication token (a string).  See also `simple-call-credentials`."
   [service]
   (let [stub (service-stub-class service)
         service-name (-> (service-class service)
                          .getSimpleName
                          (string-remove-suffix service-class-suffix))
         expand-method (fn [[method arg-types]]
-                        (let [args (repeatedly (count arg-types) #(gensym "arg"))
-                              converters (repeatedly (count arg-types) #(gensym "to-grpc"))
-                              stub (gensym "stub")]
-                          `(let ~(vec (mapcat (fn [cv type]
-                                                  `(~cv (make-converter-to-protobuf ~type)))
-                                              converters arg-types))
-                             (defn ~(csk/->kebab-case-symbol (str service-name "-" method)) ~(vec (cons stub args))
-                               (from-protobuf
-                                (. ~stub ~(symbol method)
-                                   ~@(map (fn [cv arg]
-                                            `(~cv ~arg))
-                                          converters args)))))))]
+                        (stub-method-definition service-name method arg-types))]
     `(do ~@(->> (service-methods stub)
                 (map (fn [method]
                        [(.getName method)
@@ -319,31 +397,120 @@
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-(defn service-method-signature [service method]
-  (let [c (service-implementation-class service)
-        m (or (class-method c (name method))
-              (throw (ex-info "Unknown method for class" {:class c :method method})))
-        [_ [req resp]] (method-signature m)]
-    [(.getType req)
-     (first (.. resp getType getActualTypeArguments))]))
+(defn add-interceptors [builder interceptors]
+  (doseq [interceptor interceptors]
+    (.intercept builder interceptor))
+  builder)
+
+(defn add-services [builder services]
+  (doseq [service services]
+    (.addService builder service))
+  builder)
+
+(defn make-null-server-call-listener []
+  (proxy [ServerCall$Listener][]))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; The Context is the way the gRPC library juggles thread-bound
+;; variables around.  We just use one specific entry in this Context
+;; and we set it to a Clojure map.  This is kind of reinventing the
+;; wheel, because Clojure has been having these kinds of thread-safe
+;; scoping mechanisms since ever (with-local-vars), but we need to
+;; use what we've got.
+
+(defonce ^:private ctx-key (Context/keyWithDefault "ctx" {}))
+
+(defn- make-grpc-context [v]
+  (.withValue (Context/current) ctx-key v))
+
+(defn grpc-context []
+  (.get ctx-key))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defn make-server-interceptor
+  "Create a server interceptor that calls `f` on each message.  The
+  function `f` is called with three arguments the call, the metadata
+  and the context (a map). `f` is supposed to return a new context.
+  Return a `ServerInterceptor` instance."
+  [f]
+  (proxy [ServerInterceptor] []
+    (interceptCall [call metadata next-handler]
+      (try
+        (-> (f call metadata (grpc-context))
+            make-grpc-context
+            (Contexts/interceptCall call metadata next-handler))
+        (catch Exception e
+          (.close call
+                  (.withCause (or (:status (ex-data e))
+                                  (Status/INTERNAL))
+                              e)
+                  metadata)
+          (make-null-server-call-listener))))))
+
+(defn make-simple-server-auth-interceptor
+  "Instantiate a very simple server authentication interceptor.  The
+  only thing that this interceptor does is to throw an exception if
+  `f` returns false.  `f` is a function that checks that its only
+  argument is a valid authentication token; it returns true if it
+  is. `k` is the key where the auth token is to be found in the
+  metadata; it can be a Clojure keyword or a `Metadata$key` instance."
+  [k f]
+  (let [k (as-metadata-key k)]
+    (make-server-interceptor
+     (fn [call metadata context]
+       (let [token (.get metadata k)]
+         (when-not (f token)
+           (throw (ex-info "missing or invalid authentication"
+                           {:key k
+                            :token token
+                            :status (Status/UNAUTHENTICATED)
+                            :metadata metadata})))
+         {:authenticated true
+          :token token})))))
+
+(defn as-server-interceptor [x]
+  (if (instance? ServerInterceptor x)
+    x
+    (make-server-interceptor x)))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (defn start-server
-  "Start the list of GRPC `services` on port `port`."
-  [port services]
-  (let [builder (ServerBuilder/forPort port)]
-    (doseq [service services]
-      (.addService builder service))
-    (.start (.build builder))))
+  "Start the list of GRPC `services` on port `port`.  `port` is an
+  integer and `services` is a list.  Services are defined with
+  `def-service` and instantiated with make-*-service, which is
+  auto-generated by `def-service`. Return a `ServerImpl`."
+  [port services & {:keys [interceptors]}]
+  (-> (ServerBuilder/forPort port)
+      (add-interceptors (map as-server-interceptor interceptors))
+      (add-services services)
+      .build
+      .start))
+
+(defmacro with-server
+  "Execute `body` within the scope of `name` which is bound to a server
+  started on `port` and serving `services` (a vector of service names).
+  On exit, the server is shut down."
+  [[name port services & opts] & body]
+  (let [service-makers (mapv (fn [s]
+                               `(~(symbol (str "make-" s "-service"))))
+                             services)]
+    `(let [~name (start-server ~port ~service-makers ~@opts)]
+       (try
+         (do ~@body)
+         (finally
+           (.shutdown ~name))))))
 
 (defmacro def-blocking-stub-maker
   "Define a maker function for a blocking stub of `service`.  The
   resulting function accepts two arguments: a hostname and a port
   number."
   [service]
-  `(defn ~(csk/->kebab-case-symbol (str "make-" (last (s/split (str service) #"\.")) "-stub")) [host# port#]
+  `(defn ~(kcs (str "make-" (last (s/split (str service) #"\.")) "-stub")) [host# port#]
      (. ~(symbol (str service service-class-suffix)) newBlockingStub
         (-> (ManagedChannelBuilder/forAddress host# port#)
-            (.usePlaintext true)
+            .usePlaintext
             .build))))
 
 (defmacro with-channel
@@ -368,6 +535,14 @@
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
+(defn- service-method-signature [service method]
+  (let [c (service-implementation-class service)
+        m (or (class-method c (name method))
+              (throw (ex-info "Unknown method for class" {:class c :method method})))
+        [_ [req resp]] (method-signature m)]
+    [(.getType req)
+     (first (.. resp getType getActualTypeArguments))]))
+
 (defmacro ^{:style/indent [1 [:defn]]} def-service
   "Define a function that creates service objects as expected by the
   `start-server` function.  For a service Foo, the resulting function
@@ -379,8 +554,7 @@
   is performed automatically."
   [service & methods]
   (let [service-name (last (s/split (str service) #"\."))
-        super (symbol (str service service-class-suffix "$" service-name
-                           service-implementation-base-suffix))
+        super (service-implementation-class service)
         output-types (map (fn [[method & _]]
                             (second (service-method-signature service method)))
                           methods)
@@ -393,8 +567,39 @@
                               (.onNext response# (~output-converter obj#)))
                             (.onCompleted response#))))]
     `(let ~(vec (interleave converters
-                            (map (partial list 'make-converter-to-protobuf)
+                            (map (partial list `make-converter-to-protobuf)
                                  output-types)))
-       (defn ~(csk/->kebab-case-symbol (str "make-" service-name "-service")) []
-         (proxy [~super] []
+       (defn ~(kcs (str "make-" service-name "-service")) []
+         (proxy [~(symbol (.getName super))] []
            ~@(map expand-method converters methods))))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(def ^:dynamic json-preserve-field-names true)
+(def ^:dynamic json-omit-whitespace false)
+(def ^:dynamic json-include-default-values true)
+(def ^:dynamic json-enums-as-ints false)
+
+(defn protobuf->json
+  "Given a GRPC protobuf message, return a JSON string of its representation."
+  [protobuf & {:keys [preserve-field-names omit-whitespace include-default-values enum-as-ints]
+               :or {preserve-field-names json-preserve-field-names
+                    omit-whitespace json-omit-whitespace
+                    include-default-values json-include-default-values
+                    enum-as-ints json-enums-as-ints}}]
+  (.print (cond-> (JsonFormat/printer)
+            preserve-field-names .preservingProtoFieldNames
+            omit-whitespace .omittingInsignificantWhitespace
+            include-default-values .includingDefaultValueFields
+            enum-as-ints .printingEnumsAsInts)
+          protobuf))
+
+(defn make-json->protobuf [type]
+  (let [new-builder (wrap-static-method type "newBuilder" [])]
+    (fn [s]
+      (let [builder (new-builder)]
+        (.merge (JsonFormat/parser) s builder)
+        (.build builder)))))
+
+(defn make-parse-from [type]
+  (wrap-static-method type "parseFrom" [byte-array-class]))
