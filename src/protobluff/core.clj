@@ -62,9 +62,9 @@
                  (zero? (.getParameterCount method))))
        first))
 
-(defn make-converter-to-grpc
+(defn make-converter-to-protobuf
   "Make a function that accepts a Clojure type (usually a map) and
-  convert it to a GRPC POJO of type `val-type`.  Return a function."
+  convert it to a PROTOBUF POJO of type `val-type`.  Return a function."
   [val-type]
   (let [new-builder (new-builder-method val-type)]
     (cond new-builder
@@ -83,7 +83,7 @@
                              b1))
                          .build)
                      (catch Exception e
-                       (throw (ex-info "in to-grpc" {:builder b1 :type val-type :value v} e)))))))
+                       (throw (ex-info "in to-protobuf" {:builder b1 :type val-type :value v} e)))))))
 
           (class-is-enum? val-type)
           (fn [v]
@@ -133,10 +133,10 @@
               (cond (setter-method? method)
                     (let [method-key (method->key method)
                           val-type (first (.getParameterTypes method))
-                          to-grpc (make-converter-to-grpc val-type)]
+                          to-protobuf (make-converter-to-protobuf val-type)]
                       [method-key
                        (fn [builder v]
-                         (let [value (to-grpc v)]
+                         (let [value (to-protobuf v)]
                            (try
                              (invoke-method method builder value)
                              (catch Exception e
@@ -147,13 +147,13 @@
                     (adder-method? method)
                     (let [method-key (method->key method)
                           val-type (first (.getParameterTypes method))
-                          to-grpc (make-converter-to-grpc val-type)]
+                          to-protobuf (make-converter-to-protobuf val-type)]
                       [method-key
                        (fn [builder v]
                          (->> (map (fn [e]
                                      (when (or (not *ignore-nils*)
                                                (some? e))
-                                       (let [value (to-grpc e)]
+                                       (let [value (to-protobuf e)]
                                          (try
                                            (invoke-method method builder value)
                                            (catch Exception e
@@ -166,15 +166,15 @@
                     (putter-method? method)
                     (let [method-key (method->key method)
                           [key-type value-type] (map #(.getType %) (.getAnnotatedParameterTypes method))
-                          key-to-grpc (make-converter-to-grpc key-type)
-                          value-to-grpc (make-converter-to-grpc value-type)]
+                          key-to-protobuf (make-converter-to-protobuf key-type)
+                          value-to-protobuf (make-converter-to-protobuf value-type)]
                       [method-key
                        (fn [builder v]
                          (->> (map (fn [[k v]]
                                      (when (or (not *ignore-nils*)
                                                (and (some? k) (some? v)))
-                                       (let [k' (key-to-grpc k)
-                                             v' (value-to-grpc v)]
+                                       (let [k' (key-to-protobuf k)
+                                             v' (value-to-protobuf v)]
                                          (try
                                            (invoke-method method builder k' v')
                                            (catch Exception e
@@ -222,33 +222,33 @@
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
-(defmulti from-grpc
+(defmulti from-protobuf
   "Convert a protobuf response to a Clojure value.  POJOs are converted
   to standard Clojure maps."
   class)
 
-(defmethod from-grpc com.google.protobuf.Descriptors$EnumValueDescriptor
+(defmethod from-protobuf com.google.protobuf.Descriptors$EnumValueDescriptor
   [response]
   (csk/->kebab-case-keyword (.getName response)))
 
-(defmethod from-grpc com.google.protobuf.MessageOrBuilder
+(defmethod from-protobuf com.google.protobuf.MessageOrBuilder
   [response]
   (->> (.getAllFields response)
        (map (fn [[field value]]
               [(csk/->kebab-case-keyword (.getName field))
-               (from-grpc value)]))
+               (from-protobuf value)]))
        (into {})))
 
-(defmethod from-grpc java.util.Collection
+(defmethod from-protobuf java.util.Collection
   [response]
-  (let [converted (map from-grpc response)]
+  (let [converted (map from-protobuf response)]
     (if (instance? com.google.protobuf.MapEntry (first response))
       ;; this is curious but inevitable at the moment -wcp03/09/19
       (->> (map (juxt :key :value) converted)
            (into {}))
       (vec converted))))
 
-(defmethod from-grpc :default
+(defmethod from-protobuf :default
   [response]
   response)
 
@@ -303,10 +303,10 @@
                               converters (repeatedly (count arg-types) #(gensym "to-grpc"))
                               stub (gensym "stub")]
                           `(let ~(vec (mapcat (fn [cv type]
-                                                  `(~cv (cnv/make-converter-to-grpc ~type)))
+                                                  `(~cv (make-converter-to-protobuf ~type)))
                                               converters arg-types))
                              (defn ~(csk/->kebab-case-symbol (str service-name "-" method)) ~(vec (cons stub args))
-                               (from-grpc
+                               (from-protobuf
                                 (. ~stub ~(symbol method)
                                    ~@(map (fn [cv arg]
                                             `(~cv ~arg))
@@ -387,13 +387,13 @@
         converters (repeatedly (count methods) gensym)
         expand-method (fn [output-converter [method [request] & forms]]
                         `(~(csk/->camelCaseSymbol method) [request# response#]
-                          (let [~request (from-grpc request#)
+                          (let [~request (from-protobuf request#)
                                 result# (do ~@forms)]
                             (doseq [obj# result#]
                               (.onNext response# (~output-converter obj#)))
                             (.onCompleted response#))))]
     `(let ~(vec (interleave converters
-                            (map (partial list 'cnv/make-converter-to-grpc)
+                            (map (partial list 'make-converter-to-protobuf)
                                  output-types)))
        (defn ~(csk/->kebab-case-symbol (str "make-" service-name "-service")) []
          (proxy [~super] []
