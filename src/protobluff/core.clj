@@ -537,7 +537,7 @@
 
 (defn- service-method-signature [service method]
   (let [c (service-implementation-class service)
-        m (or (class-method c (name method))
+        m (or (class-method c (csk/->camelCase (name method)))
               (throw (ex-info "Unknown method for class" {:class c :method method})))
         [_ [req resp]] (method-signature m)]
     [(.getType req)
